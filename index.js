@@ -1,10 +1,12 @@
+const { webcrypto } = require('crypto');
+global.crypto = webcrypto;
 const express = require('express');
-const { WebSocketServer } = require('ws');
-const { makeWASocket, useMultiFileAuthState, DisconnectReason } = require('@whiskeysockets/baileys');
-const QRCode = require('qrcode');
-const pino = require('pino');
 const http = require('http');
 const cors = require('cors');
+const pino = require('pino');
+const QRCode = require('qrcode');
+const { WebSocketServer } = require('ws');
+const { makeWASocket, useMultiFileAuthState } = require('baileys');
 
 const app = express();
 app.use(cors());
@@ -15,103 +17,89 @@ const wss = new WebSocketServer({ server });
 
 // Stockage des sessions actives
 const sessions = new Map();
+const qrStore = new Map(); // sessionId => QR base64
 
-// Créer une session WhatsApp
+// Safe WS sender (évite crash si ws = null)
+function safeSend(ws, payload) {
+  if (ws && ws.readyState === ws.OPEN) {
+    ws.send(JSON.stringify(payload));
+  }
+}
+
+
 async function createWhatsAppSession(sessionId, ws) {
   const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${sessionId}`);
-  
+
   const sock = makeWASocket({
     auth: state,
     printQRInTerminal: false,
-    logger: pino({ level: 'silent' }),
+    logger: pino({ level: 'debug' }),
   });
 
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, lastDisconnect, qr } = update;
-
-    if (qr) {
-      const qrDataUrl = await QRCode.toDataURL(qr);
-      ws.send(JSON.stringify({
-        type: 'qr',
-        data: qrDataUrl,
-        sessionId
-      }));
-    }
-
-    if (connection === 'open') {
-      ws.send(JSON.stringify({
-        type: 'connected',
-        sessionId,
-        phone: sock.user?.id?.split(':')[0]
-      }));
-      sessions.set(sessionId, sock);
-    }
-
-    if (connection === 'close') {
-      const shouldReconnect =
-        lastDisconnect?.error?.output?.statusCode !== DisconnectReason.loggedOut;
-
-      if (shouldReconnect) {
-        createWhatsAppSession(sessionId, ws);
-      } else {
-        ws.send(JSON.stringify({ type: 'disconnected', sessionId }));
-        sessions.delete(sessionId);
-      }
-    }
-  });
-
+  // Sauvegarde creds
   sock.ev.on('creds.update', saveCreds);
 
-  sock.ev.on('messages.upsert', async ({ messages }) => {
-    for (const msg of messages) {
-      if (!msg.key.fromMe && msg.message) {
-        const text =
-          msg.message.conversation ||
-          msg.message.extendedTextMessage?.text ||
-          '';
+  // QR / ready / close
+  sock.ev.on('connection.update', async (update) => {
+    const { connection, qr, lastDisconnect } = update;
 
-        ws.send(JSON.stringify({
-          type: 'message',
-          sessionId,
-          from: msg.key.remoteJid,
-          text,
-          timestamp: msg.messageTimestamp
-        }));
-      }
-    }
+if (qr) {
+  const qrDataUrl = await QRCode.toDataURL(qr);
+
+  // stocke le QR pour affichage HTTP
+  qrStore.set(sessionId, qrDataUrl);
+
+  safeSend(ws, {
+    type: 'qr',
+    sessionId,
+    qr: qrDataUrl
+  });
+}
+
+    if (connection === 'open') {
+  safeSend(ws, { type: 'ready', sessionId });
+}
+
+if (connection === 'close') {
+  safeSend(ws, {
+    type: 'closed',
+    sessionId,
+    reason: lastDisconnect?.error?.message || 'unknown',
   });
 
+  sessions.delete(sessionId);
+}
+
+  });
+
+  sessions.set(sessionId, sock);
   return sock;
 }
 
-// WebSocket connection
+// WebSocket server
 wss.on('connection', (ws) => {
   ws.on('message', async (data) => {
     try {
-      const message = JSON.parse(data);
+      const raw = data.toString().trim();
+      if (!raw) return; // ignore empty lines from wscat
+
+      const message = JSON.parse(raw);
 
       switch (message.type) {
-        case 'init': {
-          const sessionId = message.sessionId || `session_${Date.now()}`;
-          await createWhatsAppSession(sessionId, ws);
+        case 'create': {
+          await createWhatsAppSession(message.sessionId, ws);
           break;
         }
-
-        case 'send': {
-          const session = sessions.get(message.sessionId);
-          if (session) {
-            await session.sendMessage(message.to, { text: message.text });
-            ws.send(JSON.stringify({ type: 'sent', success: true }));
-          }
-          break;
-        }
-
         case 'logout': {
           const sock = sessions.get(message.sessionId);
           if (sock) {
             await sock.logout();
             sessions.delete(message.sessionId);
           }
+          break;
+        }
+        default: {
+          ws.send(JSON.stringify({ type: 'error', message: 'Unknown message type' }));
           break;
         }
       }
@@ -125,10 +113,45 @@ wss.on('connection', (ws) => {
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', sessions: sessions.size });
 });
+// --- QR HTTP endpoint ---
+app.get('/qr/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  const qr = qrStore.get(sessionId);
 
-const PORT = process.env.PORT || 3001;
-server.listen(PORT, () => {
+  if (!qr) {
+    return res.status(404).send('QR not ready. Trigger session first.');
+  }
+
+  // qr = "data:image/png;base64,...."
+  const base64 = qr.split(',')[1];
+  const img = Buffer.from(base64, 'base64');
+
+  res.setHeader('Content-Type', 'image/png');
+  res.send(img);
+});
+// --- Create session via HTTP (Lovable) ---
+app.post('/session/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+
+  try {
+    if (!sessions.has(sessionId)) {
+      await createWhatsAppSession(sessionId, null);
+    }
+    res.json({ ok: true, sessionId });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+// --- Session status ---
+app.get('/session/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  const connected = sessions.has(sessionId);
+  res.json({ sessionId, connected });
+});
+
+const PORT = Number(process.env.PORT) || 8080;
+
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
-CTRL + O
-
+});
 
