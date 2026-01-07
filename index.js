@@ -8,6 +8,7 @@ const QRCode = require('qrcode');
 const { WebSocketServer } = require('ws');
 const { makeWASocket, useMultiFileAuthState } = require('baileys');
 
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -40,42 +41,39 @@ async function createWhatsAppSession(sessionId, ws) {
   sock.ev.on('creds.update', saveCreds);
 
   // QR / ready / close
-  sock.ev.on('connection.update', async (update) => {
-    const { connection, qr, lastDisconnect } = update;
+sock.ev.on('connection.update', async (update) => {
+  const { connection, qr, lastDisconnect } = update;
 
-if (qr) {
-  const qrDataUrl = await QRCode.toDataURL(qr);
+  if (qr) {
+    const qrDataUrl = await QRCode.toDataURL(qr);
 
-  // stocke le QR pour affichage HTTP
-  qrStore.set(sessionId, qrDataUrl);
+    // stocke le QR pour affichage HTTP
+    qrStore.set(sessionId, qrDataUrl);
 
-  safeSend(ws, {
-    type: 'qr',
-    sessionId,
-    qr: qrDataUrl
-  });
-}
+    // envoie au client WS (si ws existe)
+    safeSend(ws, { type: 'qr', sessionId, qr: qrDataUrl });
+  }
 
-    if (connection === 'open') {
-  safeSend(ws, { type: 'ready', sessionId });
-}
+  if (connection === 'open') {
+    sessions.set(sessionId, sock);
+    safeSend(ws, { type: 'ready', sessionId });
+  }
 
-if (connection === 'close') {
-  safeSend(ws, {
-    type: 'closed',
-    sessionId,
-    reason: lastDisconnect?.error?.message || 'unknown',
-  });
+  if (connection === 'close') {
+    sessions.delete(sessionId);
+    safeSend(ws, {
+      type: 'closed',
+      sessionId,
+      reason: lastDisconnect?.error?.message || 'unknown',
+    });
+  }
+});
 
-  sessions.delete(sessionId);
-}
 
-  });
-
-  sessions.set(sessionId, sock);
   return sock;
 }
 
+  
 // WebSocket server
 wss.on('connection', (ws) => {
   ws.on('message', async (data) => {
