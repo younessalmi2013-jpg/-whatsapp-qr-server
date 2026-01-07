@@ -6,7 +6,7 @@ const cors = require('cors');
 const pino = require('pino');
 const QRCode = require('qrcode');
 const { WebSocketServer } = require('ws');
-const { makeWASocket, useMultiFileAuthState } = require('baileys');
+const { makeWASocket, useMultiFileAuthState } = require('@whiskeysockets/baileys');
 
 
 const app = express();
