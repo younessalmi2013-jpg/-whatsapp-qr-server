@@ -44,6 +44,20 @@ async function createWhatsAppSession(sessionId, ws) {
 sock.ev.on('connection.update', async (update) => {
   const { connection, qr, lastDisconnect } = update;
 
+  console.log('[WA] update:', sessionId, {
+  connection,
+  hasQr: !!qr
+});
+
+if (qr) {
+  console.log('[WA] QR RECEIVED for', sessionId);
+}
+
+if (lastDisconnect?.error) {
+  console.log('[WA] lastDisconnect:', sessionId, lastDisconnect.error?.message);
+}
+
+
   if (qr) {
     const qrDataUrl = await QRCode.toDataURL(qr);
 
@@ -130,6 +144,8 @@ app.get('/qr/:sessionId', (req, res) => {
 // --- Create session via HTTP (Lovable) ---
 app.post('/session/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
+
+  console.log('[HTTP] create session:', sessionId);
 
   try {
     if (!sessions.has(sessionId)) {
