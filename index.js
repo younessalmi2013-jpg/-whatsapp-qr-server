@@ -31,11 +31,24 @@ function safeSend(ws, payload) {
 async function createWhatsAppSession(sessionId, ws) {
   const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${sessionId}`);
 
-  const sock = makeWASocket({
-    auth: state,
-    printQRInTerminal: false,
-    logger: pino({ level: 'debug' }),
-  });
+const sock = makeWASocket({
+  auth: state,
+
+  // important en prod pour debug
+  printQRInTerminal: true,
+  logger: pino({ level: 'info' }),
+
+  // stabilité prod
+  browser: ['Chrome', 'Linux', '1.0'],
+  connectTimeoutMs: 60_000,
+  keepAliveIntervalMs: 20_000,
+  defaultQueryTimeoutMs: 60_000,
+  markOnlineOnConnect: false,
+  syncFullHistory: false,
+  generateHighQualityLinkPreview: false,
+});
+
+
 
   // Sauvegarde creds
   sock.ev.on('creds.update', saveCreds);
@@ -43,6 +56,10 @@ async function createWhatsAppSession(sessionId, ws) {
   // QR / ready / close
 sock.ev.on('connection.update', async (update) => {
   const { connection, qr, lastDisconnect } = update;
+if (lastDisconnect?.error) {
+  console.log('[WA] lastDisconnect full:', JSON.stringify(lastDisconnect, null, 2));
+}
+
 
   console.log('[WA] update:', sessionId, {
   connection,
@@ -156,6 +173,35 @@ app.post('/session/:sessionId', async (req, res) => {
     res.status(500).json({ ok: false, error: e.message });
   }
 });
+
+// --- Pairing code (PROD friendly) ---
+// appel: POST /pair/test1  { "phone": "2126XXXXXXXX" }
+app.post('/pair/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  const phone = (req.body?.phone || '').replace(/\D/g, '');
+
+  if (!phone) {
+    return res.status(400).json({ ok: false, error: 'Missing phone in body' });
+  }
+
+  try {
+    // crée la session si pas déjà
+    if (!sessions.has(sessionId)) {
+      const sock = await createWhatsAppSession(sessionId, null);
+      sessions.set(sessionId, sock);
+    }
+
+    const sock = sessions.get(sessionId);
+
+    // IMPORTANT: pairing code (évite QR)
+    const code = await sock.requestPairingCode(phone);
+
+    res.json({ ok: true, sessionId, pairingCode: code });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
+  }
+});
+
 // --- Session status ---
 app.get('/session/:sessionId', (req, res) => {
   const { sessionId } = req.params;
