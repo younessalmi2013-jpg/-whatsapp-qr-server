@@ -28,8 +28,11 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// ====== PERSISTENT SESSION DIR (Render Disk) ======
-const SESSION_DIR = process.env.SESSION_DIR || path.join(process.cwd(), 'sessions');
+/**
+ * PERSISTENCE DIR
+ * Render disk: /data  (tu as déjà /data/sessions OK)
+ */
+const SESSION_DIR = process.env.SESSION_DIR || path.join(__dirname, 'sessions');
 fs.mkdirSync(SESSION_DIR, { recursive: true });
 
 // sessionId => sock
@@ -52,16 +55,31 @@ function setStatus(sessionId, patch) {
 
 function safeSend(ws, payload) {
   try {
-    if (ws && ws.readyState === WS.OPEN) {
-      ws.send(JSON.stringify(payload));
-    }
+    if (ws && ws.readyState === WS.OPEN) ws.send(JSON.stringify(payload));
   } catch (_) {}
 }
 
+function sessionPath(sessionId) {
+  return path.join(SESSION_DIR, sessionId);
+}
+
+function rmrfSafe(p) {
+  try {
+    fs.rmSync(p, { recursive: true, force: true });
+  } catch (_) {}
+}
+
+function delay(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 // ================================
-// Helpers: wait open + retry (PROD)
+// WAIT OPEN (avoid "open before listener")
 // ================================
-function waitForConnectionOpen(sock, timeoutMs = 25000) {
+function waitForConnectionOpen(sessionId, sock, timeoutMs = 90000) {
+  const s = statusStore.get(sessionId);
+  if (s?.connection === 'open' || s?.connected === true) return Promise.resolve(true);
+
   return new Promise((resolve, reject) => {
     let done = false;
 
@@ -69,7 +87,7 @@ function waitForConnectionOpen(sock, timeoutMs = 25000) {
       if (done) return;
       done = true;
       try { sock.ev.off('connection.update', onUpdate); } catch {}
-      reject(new Error('Timeout waiting for connection open'));
+      reject(new Error(`Timeout waiting for connection open (${timeoutMs}ms)`));
     }, timeoutMs);
 
     const onUpdate = (update) => {
@@ -96,36 +114,56 @@ function waitForConnectionOpen(sock, timeoutMs = 25000) {
   });
 }
 
-async function retry(fn, tries = 3, delayMs = 1500) {
+async function retry(fn, tries = 3, delayMs = 2500) {
   let lastError;
   for (let i = 0; i < tries; i++) {
     try {
       return await fn(i + 1);
     } catch (e) {
       lastError = e;
-      await new Promise((r) => setTimeout(r, delayMs));
+      await delay(delayMs);
     }
   }
   throw lastError;
 }
 
+function destroySocket(sessionId) {
+  try {
+    const sock = sessions.get(sessionId);
+    if (sock) {
+      // best-effort close
+      sock.end?.();
+      sock.ws?.close?.();
+    }
+  } catch (_) {}
+  sessions.delete(sessionId);
+  qrStore.delete(sessionId);
+}
+
+async function hardResetSession(sessionId) {
+  destroySocket(sessionId);
+  rmrfSafe(sessionPath(sessionId)); // delete creds
+  setStatus(sessionId, { phase: 'reset', registered: false, hasQr: false, connected: false });
+}
+
 // ================================
-// Session lifecycle
+// CREATE SESSION
 // ================================
 async function createWhatsAppSession(sessionId, ws) {
   if (sessions.has(sessionId)) return sessions.get(sessionId);
 
   setStatus(sessionId, { phase: 'creating' });
 
-  const sessionPath = path.join(SESSION_DIR, sessionId);
-  fs.mkdirSync(sessionPath, { recursive: true });
+  const authDir = sessionPath(sessionId);
+  fs.mkdirSync(authDir, { recursive: true });
 
-  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
     logger,
+    printQRInTerminal: false, // on gère nous-mêmes via connection.update
     browser: ['Chrome', 'Linux', '1.0'],
     auth: {
       creds: state.creds,
@@ -139,12 +177,13 @@ async function createWhatsAppSession(sessionId, ws) {
     generateHighQualityLinkPreview: false,
   });
 
-  // store immediately so /pair works
   sessions.set(sessionId, sock);
 
   setStatus(sessionId, {
-    registered: !!sock.authState?.creds?.registered,
     phase: 'created',
+    registered: !!sock.authState?.creds?.registered,
+    hasQr: false,
+    connected: false,
   });
 
   sock.ev.on('creds.update', saveCreds);
@@ -152,67 +191,60 @@ async function createWhatsAppSession(sessionId, ws) {
   sock.ev.on('connection.update', async (update) => {
     const { connection, qr, lastDisconnect } = update;
 
-    setStatus(sessionId, {
-      connection,
-      hasQr: !!qr,
-    });
+    setStatus(sessionId, { connection });
 
     if (qr) {
       try {
         const qrDataUrl = await QRCode.toDataURL(qr);
         qrStore.set(sessionId, qrDataUrl);
+        setStatus(sessionId, { hasQr: true, phase: 'qr_ready' });
         safeSend(ws, { type: 'qr', sessionId, qr: qrDataUrl });
       } catch (e) {
-        setStatus(sessionId, { lastError: `QR build error: ${e?.message || e}` });
+        setStatus(sessionId, { phase: 'qr_error', lastError: e?.message || String(e) });
       }
     }
 
     if (connection === 'open') {
-      setStatus(sessionId, { connected: true, phase: 'open' });
+      setStatus(sessionId, { connected: true, phase: 'open', hasQr: false });
       safeSend(ws, { type: 'ready', sessionId });
     }
 
     if (connection === 'close') {
       const err = lastDisconnect?.error;
       const msg = err?.message || 'unknown';
+      setStatus(sessionId, { connected: false, phase: 'closed', lastError: msg, hasQr: false });
 
-      setStatus(sessionId, { connected: false, phase: 'closed', lastError: msg });
-
-      // If logged out: cleanup memory (disk remains unless you /reset)
+      // 1) logout => reset in-memory
       const code = err?.output?.statusCode;
       const reason = err?.output?.payload?.message;
+
       if (reason === DisconnectReason.loggedOut || code === DisconnectReason.loggedOut) {
-        sessions.delete(sessionId);
-        qrStore.delete(sessionId);
-        setStatus(sessionId, { loggedOut: true });
+        destroySocket(sessionId);
+        return;
       }
+
+      // 2) IMPORTANT: AUTO-HEAL on "QR refs attempts ended"
+      // C'est EXACTEMENT ton problème.
+      if ((msg || '').toLowerCase().includes('qr refs attempts ended')) {
+        // on recrée automatiquement un nouveau socket propre
+        destroySocket(sessionId);
+        setStatus(sessionId, { phase: 'auto_recreate_after_qr_end' });
+        await delay(1500);
+        await createWhatsAppSession(sessionId, ws);
+        return;
+      }
+
+      // 3) other failures: keep sock map cleaned
+      // (on laisse la session existante si tu veux, mais c'est plus safe de recréer au prochain /session)
+      destroySocket(sessionId);
     }
   });
 
   return sock;
 }
 
-async function destroySession(sessionId) {
-  try {
-    const sock = sessions.get(sessionId);
-    if (sock) {
-      try { await sock.logout(); } catch {}
-      try { sock.end?.(); } catch {}
-    }
-  } catch {}
-  sessions.delete(sessionId);
-  qrStore.delete(sessionId);
-  statusStore.delete(sessionId);
-
-  // delete files on disk
-  const sessionPath = path.join(SESSION_DIR, sessionId);
-  try {
-    fs.rmSync(sessionPath, { recursive: true, force: true });
-  } catch {}
-}
-
 // ================================
-// WS
+// WS SERVER (optional)
 // ================================
 wss.on('connection', (ws) => {
   ws.on('message', async (data) => {
@@ -228,23 +260,23 @@ wss.on('connection', (ws) => {
       }
 
       if (message.type === 'logout') {
-        await destroySession(message.sessionId);
+        await hardResetSession(message.sessionId);
         ws.send(JSON.stringify({ ok: true, type: 'logged_out', sessionId: message.sessionId }));
         return;
       }
 
       ws.send(JSON.stringify({ ok: false, type: 'error', message: 'Unknown message type' }));
-    } catch (error) {
-      ws.send(JSON.stringify({ ok: false, type: 'error', message: error.message }));
+    } catch (e) {
+      ws.send(JSON.stringify({ ok: false, type: 'error', message: e.message }));
     }
   });
 });
 
 // ================================
-// HTTP endpoints
+// HTTP ENDPOINTS
 // ================================
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', sessions: sessions.size, sessionDir: SESSION_DIR });
+  res.json({ status: 'ok', sessions: sessions.size });
 });
 
 app.get('/version', (req, res) => {
@@ -268,7 +300,14 @@ app.get('/debug/:sessionId', (req, res) => {
   });
 });
 
-// Create session
+// Reset HARD (delete creds on disk)
+app.post('/reset/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  await hardResetSession(sessionId);
+  res.json({ ok: true, sessionId, reset: true });
+});
+
+// Create session (start WA)
 app.post('/session/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
   try {
@@ -279,21 +318,12 @@ app.post('/session/:sessionId', async (req, res) => {
   }
 });
 
-// Reset session (PROPRE) — supprime la session + fichiers
-app.post('/reset/:sessionId', async (req, res) => {
-  const { sessionId } = req.params;
-  await destroySession(sessionId);
-  res.json({ ok: true, sessionId, reset: true });
-});
-
 // QR PNG
 app.get('/qr/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   const qr = qrStore.get(sessionId);
 
-  if (!qr) {
-    return res.status(404).send('QR not ready. Trigger session first.');
-  }
+  if (!qr) return res.status(404).send('QR not ready. Trigger session first.');
 
   const base64 = qr.split(',')[1];
   const img = Buffer.from(base64, 'base64');
@@ -301,7 +331,8 @@ app.get('/qr/:sessionId', (req, res) => {
   res.send(img);
 });
 
-// Pairing code
+// Pairing code (more stable than QR in datacenter)
+// POST /pair/test1  { "phone":"336XXXXXXXX" }
 app.post('/pair/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
   const phone = (req.body?.phone || '').replace(/\D/g, '');
@@ -311,23 +342,19 @@ app.post('/pair/:sessionId', async (req, res) => {
     const pairingCode = await retry(async (attempt) => {
       setStatus(sessionId, { phase: `pair_attempt_${attempt}` });
 
-      // on retry: recrée socket propre
-      if (attempt > 1) {
-        try {
-          const old = sessions.get(sessionId);
-          if (old) old.end?.();
-        } catch {}
-        sessions.delete(sessionId);
-        qrStore.delete(sessionId);
-      }
+      // recreate each attempt (avoid dead socket)
+      destroySocket(sessionId);
 
       const sock = await createWhatsAppSession(sessionId, null);
-      await waitForConnectionOpen(sock, 25000);
+
+      // wait open (Render can be slow)
+      await waitForConnectionOpen(sessionId, sock, 90000);
 
       const code = await sock.requestPairingCode(phone);
       setStatus(sessionId, { phase: 'pairing_code_issued' });
+
       return code;
-    }, 3, 2000);
+    }, 3, 3000);
 
     res.json({ ok: true, sessionId, pairingCode });
   } catch (e) {
@@ -336,23 +363,7 @@ app.post('/pair/:sessionId', async (req, res) => {
   }
 });
 
-app.get('/session/:sessionId', (req, res) => {
-  const { sessionId } = req.params;
-  const s = statusStore.get(sessionId) || {};
-  res.json({
-    sessionId,
-    connected: !!s.connected,
-    connection: s.connection || null,
-    hasQr: !!s.hasQr,
-    registered: s.registered ?? null,
-    phase: s.phase || null,
-    lastError: s.lastError || null,
-    updatedAt: s.updatedAt || null,
-  });
-});
-
 const PORT = Number(process.env.PORT) || 8080;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
-  console.log(`SESSION_DIR=${SESSION_DIR}`);
 });
