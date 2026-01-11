@@ -45,16 +45,13 @@ function setStatus(sessionId, patch) {
 
 function safeSend(ws, payload) {
   try {
-    if (ws && ws.readyState === WS.OPEN) {
-      ws.send(JSON.stringify(payload));
-    }
+    if (ws && ws.readyState === WS.OPEN) ws.send(JSON.stringify(payload));
   } catch (_) {}
 }
 
 // ================================
 // Helpers: wait open + retry (PROD)
 // ================================
-
 function waitForConnectionOpen(sock, timeoutMs = 25000) {
   return new Promise((resolve, reject) => {
     let done = false;
@@ -62,9 +59,7 @@ function waitForConnectionOpen(sock, timeoutMs = 25000) {
     const timer = setTimeout(() => {
       if (done) return;
       done = true;
-      try {
-        sock.ev.off('connection.update', onUpdate);
-      } catch {}
+      try { sock.ev.off('connection.update', onUpdate); } catch {}
       reject(new Error('Timeout waiting for connection open'));
     }, timeoutMs);
 
@@ -75,9 +70,7 @@ function waitForConnectionOpen(sock, timeoutMs = 25000) {
         if (done) return;
         done = true;
         clearTimeout(timer);
-        try {
-          sock.ev.off('connection.update', onUpdate);
-        } catch {}
+        try { sock.ev.off('connection.update', onUpdate); } catch {}
         resolve(true);
       }
 
@@ -85,9 +78,7 @@ function waitForConnectionOpen(sock, timeoutMs = 25000) {
         if (done) return;
         done = true;
         clearTimeout(timer);
-        try {
-          sock.ev.off('connection.update', onUpdate);
-        } catch {}
+        try { sock.ev.off('connection.update', onUpdate); } catch {}
         reject(new Error('Connection closed before open'));
       }
     };
@@ -120,14 +111,12 @@ async function createWhatsAppSession(sessionId, ws) {
   const sock = makeWASocket({
     version,
     logger,
-    printQRInTerminal: true, // debug
+    printQRInTerminal: true,
     browser: ['Chrome', 'Linux', '1.0'],
     auth: {
       creds: state.creds,
       keys: makeCacheableSignalKeyStore(state.keys, logger),
     },
-
-    // stabilité prod
     connectTimeoutMs: 60_000,
     keepAliveIntervalMs: 20_000,
     defaultQueryTimeoutMs: 60_000,
@@ -136,11 +125,10 @@ async function createWhatsAppSession(sessionId, ws) {
     generateHighQualityLinkPreview: false,
   });
 
-  // IMPORTANT: stocker tout de suite (pour /pair même avant open)
+  // IMPORTANT: stocker direct pour /pair même avant open
   sessions.set(sessionId, sock);
 
   if (!sock.authState?.creds?.registered) {
-    console.log('[WA] session not registered yet (QR/pairing expected):', sessionId);
     setStatus(sessionId, { registered: false });
   } else {
     setStatus(sessionId, { registered: true });
@@ -156,21 +144,19 @@ async function createWhatsAppSession(sessionId, ws) {
       hasQr: !!qr,
     });
 
-    console.log('[WA] update:', sessionId, { connection, hasQr: !!qr });
+    logger.info({ sessionId, connection, hasQr: !!qr }, '[WA] connection.update');
 
     if (qr) {
       try {
-        console.log('[WA] QR RECEIVED for', sessionId);
         const qrDataUrl = await QRCode.toDataURL(qr);
         qrStore.set(sessionId, qrDataUrl);
         safeSend(ws, { type: 'qr', sessionId, qr: qrDataUrl });
       } catch (e) {
-        console.log('[WA] QR build error:', sessionId, e?.message || e);
+        logger.error({ sessionId, err: e?.message || e }, '[WA] QR build error');
       }
     }
 
     if (connection === 'open') {
-      console.log('[WA] CONNECTED:', sessionId);
       setStatus(sessionId, { connected: true, phase: 'open' });
       safeSend(ws, { type: 'ready', sessionId });
     }
@@ -178,13 +164,6 @@ async function createWhatsAppSession(sessionId, ws) {
     if (connection === 'close') {
       const err = lastDisconnect?.error;
       const msg = err?.message || 'unknown';
-      console.log('[WA] CLOSED:', sessionId, msg);
-
-      if (err) {
-        try {
-          console.log('[WA] lastDisconnect full:', JSON.stringify(lastDisconnect, null, 2));
-        } catch (_) {}
-      }
 
       setStatus(sessionId, { connected: false, phase: 'closed', lastError: msg });
 
@@ -209,7 +188,7 @@ wss.on('connection', (ws) => {
   ws.on('message', async (data) => {
     try {
       const raw = data.toString().trim();
-      if (!raw) return; // ignore empty lines
+      if (!raw) return;
       const message = JSON.parse(raw);
 
       if (message.type === 'create') {
@@ -239,9 +218,16 @@ wss.on('connection', (ws) => {
 // HTTP endpoints
 // ================================
 
-// Health
+// Health (inclut preuve version/commit => plus jamais “déploiement fantôme”)
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', sessions: sessions.size });
+  res.json({
+    status: 'ok',
+    sessions: sessions.size,
+    node: process.version,
+    commit: process.env.RAILWAY_GIT_COMMIT_SHA || null,
+    service: process.env.RAILWAY_SERVICE_NAME || null,
+    ts: new Date().toISOString(),
+  });
 });
 
 // Version proof (debug deploy)
@@ -256,11 +242,9 @@ app.get('/version', (req, res) => {
   });
 });
 
-
-// Debug status (OBLIGATOIRE pour comprendre les QR)
+// Debug status
 app.get('/debug/:sessionId', (req, res) => {
   const { sessionId } = req.params;
-
   res.json({
     sessionId,
     hasSock: sessions.has(sessionId),
@@ -271,10 +255,9 @@ app.get('/debug/:sessionId', (req, res) => {
   });
 });
 
-// Create session (Lovable)
+// Create session
 app.post('/session/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
-  console.log('[HTTP] create session:', sessionId);
 
   try {
     await createWhatsAppSession(sessionId, null);
@@ -289,9 +272,7 @@ app.get('/qr/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   const qr = qrStore.get(sessionId);
 
-  if (!qr) {
-    return res.status(404).send('QR not ready. Trigger session first.');
-  }
+  if (!qr) return res.status(404).send('QR not ready. Trigger session first.');
 
   const base64 = qr.split(',')[1];
   const img = Buffer.from(base64, 'base64');
@@ -299,8 +280,7 @@ app.get('/qr/:sessionId', (req, res) => {
   res.send(img);
 });
 
-// Pairing code (PROD)
-// POST /pair/test1  { "phone":"336XXXXXXXX" }
+// Pairing code (wait open + retry)
 app.post('/pair/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
   const phone = (req.body?.phone || '').replace(/\D/g, '');
@@ -308,9 +288,9 @@ app.post('/pair/:sessionId', async (req, res) => {
 
   try {
     const code = await retry(async (attempt) => {
-      console.log(`[PAIR] attempt ${attempt} for ${sessionId}`);
+      logger.info({ attempt, sessionId }, '[PAIR] attempt');
 
-      // force recreate on retry to avoid dead socket
+      // recreate on retry
       if (attempt > 1) {
         try {
           const old = sessions.get(sessionId);
@@ -323,12 +303,10 @@ app.post('/pair/:sessionId', async (req, res) => {
 
       const sock = await createWhatsAppSession(sessionId, null);
 
-      // IMPORTANT: wait for open before requesting pairing code
+      // wait open
       await waitForConnectionOpen(sock, 25000);
 
-      // pairing code
       const pairingCode = await sock.requestPairingCode(phone);
-
       setStatus(sessionId, { phase: 'pairing_code_issued' });
       return pairingCode;
     }, 3, 2000);
@@ -356,10 +334,8 @@ app.get('/session/:sessionId', (req, res) => {
   });
 });
 
-// ================================
-// Listen (Railway)
-// ================================
 const PORT = Number(process.env.PORT) || 8080;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
 });
+
