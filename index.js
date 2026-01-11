@@ -244,6 +244,17 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', sessions: sessions.size });
 });
 
+// Debug status
+app.get('/debug/:sessionId', (req, res) => {
+  const { sessionId } = req.params;
+  res.json({
+    sessionId,
+    hasSock: sessions.has(sessionId),
+    hasQr: qrStore.has(sessionId),
+    status: statusStore.get(sessionId) || null,
+  });
+});
+
 // Debug status (OBLIGATOIRE pour comprendre les QR)
 app.get('/debug/:sessionId', (req, res) => {
   const { sessionId } = req.params;
