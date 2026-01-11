@@ -244,6 +244,19 @@ app.get('/health', (req, res) => {
   res.json({ status: 'ok', sessions: sessions.size });
 });
 
+// Version proof (debug deploy)
+app.get('/version', (req, res) => {
+  res.json({
+    ok: true,
+    node: process.version,
+    envPort: process.env.PORT || null,
+    railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || null,
+    railwayService: process.env.RAILWAY_SERVICE_NAME || null,
+    ts: new Date().toISOString(),
+  });
+});
+
+
 // Debug status (OBLIGATOIRE pour comprendre les QR)
 app.get('/debug/:sessionId', (req, res) => {
   const { sessionId } = req.params;
