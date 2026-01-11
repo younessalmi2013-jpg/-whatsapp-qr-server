@@ -1,6 +1,9 @@
 const { webcrypto } = require('crypto');
 if (!global.crypto) global.crypto = webcrypto;
 
+const fs = require('fs');
+const path = require('path');
+
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
@@ -25,6 +28,10 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+// ====== PERSISTENT SESSION DIR (Render Disk) ======
+const SESSION_DIR = process.env.SESSION_DIR || path.join(process.cwd(), 'sessions');
+fs.mkdirSync(SESSION_DIR, { recursive: true });
+
 // sessionId => sock
 const sessions = new Map();
 // sessionId => dataURL QR
@@ -45,7 +52,9 @@ function setStatus(sessionId, patch) {
 
 function safeSend(ws, payload) {
   try {
-    if (ws && ws.readyState === WS.OPEN) ws.send(JSON.stringify(payload));
+    if (ws && ws.readyState === WS.OPEN) {
+      ws.send(JSON.stringify(payload));
+    }
   } catch (_) {}
 }
 
@@ -100,18 +109,23 @@ async function retry(fn, tries = 3, delayMs = 1500) {
   throw lastError;
 }
 
+// ================================
+// Session lifecycle
+// ================================
 async function createWhatsAppSession(sessionId, ws) {
   if (sessions.has(sessionId)) return sessions.get(sessionId);
 
   setStatus(sessionId, { phase: 'creating' });
 
-  const { state, saveCreds } = await useMultiFileAuthState(`./sessions/${sessionId}`);
+  const sessionPath = path.join(SESSION_DIR, sessionId);
+  fs.mkdirSync(sessionPath, { recursive: true });
+
+  const { state, saveCreds } = await useMultiFileAuthState(sessionPath);
   const { version } = await fetchLatestBaileysVersion();
 
   const sock = makeWASocket({
     version,
     logger,
-    printQRInTerminal: true,
     browser: ['Chrome', 'Linux', '1.0'],
     auth: {
       creds: state.creds,
@@ -125,14 +139,13 @@ async function createWhatsAppSession(sessionId, ws) {
     generateHighQualityLinkPreview: false,
   });
 
-  // IMPORTANT: stocker direct pour /pair même avant open
+  // store immediately so /pair works
   sessions.set(sessionId, sock);
 
-  if (!sock.authState?.creds?.registered) {
-    setStatus(sessionId, { registered: false });
-  } else {
-    setStatus(sessionId, { registered: true });
-  }
+  setStatus(sessionId, {
+    registered: !!sock.authState?.creds?.registered,
+    phase: 'created',
+  });
 
   sock.ev.on('creds.update', saveCreds);
 
@@ -144,15 +157,13 @@ async function createWhatsAppSession(sessionId, ws) {
       hasQr: !!qr,
     });
 
-    logger.info({ sessionId, connection, hasQr: !!qr }, '[WA] connection.update');
-
     if (qr) {
       try {
         const qrDataUrl = await QRCode.toDataURL(qr);
         qrStore.set(sessionId, qrDataUrl);
         safeSend(ws, { type: 'qr', sessionId, qr: qrDataUrl });
       } catch (e) {
-        logger.error({ sessionId, err: e?.message || e }, '[WA] QR build error');
+        setStatus(sessionId, { lastError: `QR build error: ${e?.message || e}` });
       }
     }
 
@@ -167,7 +178,7 @@ async function createWhatsAppSession(sessionId, ws) {
 
       setStatus(sessionId, { connected: false, phase: 'closed', lastError: msg });
 
-      // si logout, on nettoie
+      // If logged out: cleanup memory (disk remains unless you /reset)
       const code = err?.output?.statusCode;
       const reason = err?.output?.payload?.message;
       if (reason === DisconnectReason.loggedOut || code === DisconnectReason.loggedOut) {
@@ -181,8 +192,27 @@ async function createWhatsAppSession(sessionId, ws) {
   return sock;
 }
 
+async function destroySession(sessionId) {
+  try {
+    const sock = sessions.get(sessionId);
+    if (sock) {
+      try { await sock.logout(); } catch {}
+      try { sock.end?.(); } catch {}
+    }
+  } catch {}
+  sessions.delete(sessionId);
+  qrStore.delete(sessionId);
+  statusStore.delete(sessionId);
+
+  // delete files on disk
+  const sessionPath = path.join(SESSION_DIR, sessionId);
+  try {
+    fs.rmSync(sessionPath, { recursive: true, force: true });
+  } catch {}
+}
+
 // ================================
-// WS server
+// WS
 // ================================
 wss.on('connection', (ws) => {
   ws.on('message', async (data) => {
@@ -198,11 +228,7 @@ wss.on('connection', (ws) => {
       }
 
       if (message.type === 'logout') {
-        const sock = sessions.get(message.sessionId);
-        if (sock) await sock.logout();
-        sessions.delete(message.sessionId);
-        qrStore.delete(message.sessionId);
-        setStatus(message.sessionId, { loggedOut: true });
+        await destroySession(message.sessionId);
         ws.send(JSON.stringify({ ok: true, type: 'logged_out', sessionId: message.sessionId }));
         return;
       }
@@ -217,32 +243,19 @@ wss.on('connection', (ws) => {
 // ================================
 // HTTP endpoints
 // ================================
-
-// Health (inclut preuve version/commit => plus jamais “déploiement fantôme”)
 app.get('/health', (req, res) => {
-  res.json({
-    status: 'ok',
-    sessions: sessions.size,
-    node: process.version,
-    commit: process.env.RAILWAY_GIT_COMMIT_SHA || null,
-    service: process.env.RAILWAY_SERVICE_NAME || null,
-    ts: new Date().toISOString(),
-  });
+  res.json({ status: 'ok', sessions: sessions.size, sessionDir: SESSION_DIR });
 });
 
-// Version proof (debug deploy)
 app.get('/version', (req, res) => {
   res.json({
     ok: true,
     node: process.version,
-    envPort: process.env.PORT || null,
-    railwayCommit: process.env.RAILWAY_GIT_COMMIT_SHA || null,
-    railwayService: process.env.RAILWAY_SERVICE_NAME || null,
+    sessionDir: SESSION_DIR,
     ts: new Date().toISOString(),
   });
 });
 
-// Debug status
 app.get('/debug/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   res.json({
@@ -258,7 +271,6 @@ app.get('/debug/:sessionId', (req, res) => {
 // Create session
 app.post('/session/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
-
   try {
     await createWhatsAppSession(sessionId, null);
     res.json({ ok: true, sessionId });
@@ -267,12 +279,21 @@ app.post('/session/:sessionId', async (req, res) => {
   }
 });
 
+// Reset session (PROPRE) — supprime la session + fichiers
+app.post('/reset/:sessionId', async (req, res) => {
+  const { sessionId } = req.params;
+  await destroySession(sessionId);
+  res.json({ ok: true, sessionId, reset: true });
+});
+
 // QR PNG
 app.get('/qr/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   const qr = qrStore.get(sessionId);
 
-  if (!qr) return res.status(404).send('QR not ready. Trigger session first.');
+  if (!qr) {
+    return res.status(404).send('QR not ready. Trigger session first.');
+  }
 
   const base64 = qr.split(',')[1];
   const img = Buffer.from(base64, 'base64');
@@ -280,45 +301,41 @@ app.get('/qr/:sessionId', (req, res) => {
   res.send(img);
 });
 
-// Pairing code (wait open + retry)
+// Pairing code
 app.post('/pair/:sessionId', async (req, res) => {
   const { sessionId } = req.params;
   const phone = (req.body?.phone || '').replace(/\D/g, '');
   if (!phone) return res.status(400).json({ ok: false, error: 'Missing phone in body' });
 
   try {
-    const code = await retry(async (attempt) => {
-      logger.info({ attempt, sessionId }, '[PAIR] attempt');
+    const pairingCode = await retry(async (attempt) => {
+      setStatus(sessionId, { phase: `pair_attempt_${attempt}` });
 
-      // recreate on retry
+      // on retry: recrée socket propre
       if (attempt > 1) {
         try {
           const old = sessions.get(sessionId);
           if (old) old.end?.();
-        } catch (_) {}
+        } catch {}
         sessions.delete(sessionId);
         qrStore.delete(sessionId);
-        setStatus(sessionId, { phase: 'retry_recreate' });
       }
 
       const sock = await createWhatsAppSession(sessionId, null);
-
-      // wait open
       await waitForConnectionOpen(sock, 25000);
 
-      const pairingCode = await sock.requestPairingCode(phone);
+      const code = await sock.requestPairingCode(phone);
       setStatus(sessionId, { phase: 'pairing_code_issued' });
-      return pairingCode;
+      return code;
     }, 3, 2000);
 
-    res.json({ ok: true, sessionId, pairingCode: code });
+    res.json({ ok: true, sessionId, pairingCode });
   } catch (e) {
     setStatus(sessionId, { phase: 'pairing_failed', lastError: e.message });
     res.status(500).json({ ok: false, error: e.message });
   }
 });
 
-// Session status
 app.get('/session/:sessionId', (req, res) => {
   const { sessionId } = req.params;
   const s = statusStore.get(sessionId) || {};
@@ -337,5 +354,5 @@ app.get('/session/:sessionId', (req, res) => {
 const PORT = Number(process.env.PORT) || 8080;
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Server running on port ${PORT}`);
+  console.log(`SESSION_DIR=${SESSION_DIR}`);
 });
-
